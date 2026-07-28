@@ -151,6 +151,12 @@ Each course has a private metadata cache beneath the sync directory. The cache
 records the previous inventory and source metadata needed to recognize unchanged
 or updated material.
 
+Every completed download also records one complete local artifact: its portable
+path relative to the sync directory, SHA-256 content hash, actual byte size, and
+stable remote identity. The identity associates the file with its remote
+resource; it remains separate from revision metadata and is not treated as proof
+that the remote bytes are unchanged.
+
 Depending on the source, remote-change detection can use:
 
 - Moodle content hashes;
@@ -303,6 +309,8 @@ Some outputs are generated rather than copied byte-for-byte from Moodle:
 
 Generated outputs participate in the same inventory, update, and local-conflict
 model where the source provides enough identity and version information.
+YouTube and emedia outputs are first written to private staging paths, then
+verified and atomically installed as concrete managed artifacts.
 
 ## Failure and exit behavior
 

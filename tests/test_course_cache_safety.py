@@ -66,6 +66,44 @@ def tagged_v1_payload(*, site=MOODLE_URL):
     }
 
 
+@pytest.mark.parametrize(
+    "artifact",
+    [
+        {
+            "path": "../outside.mp4",
+            "content_hash": "a" * 64,
+            "size": 1,
+            "remote_identity": "youtube:abcdefghijk",
+        },
+        {
+            "path": "26ss/Course/video.mp4",
+            "content_hash": "not-a-sha256",
+            "size": 1,
+            "remote_identity": "youtube:abcdefghijk",
+        },
+        {
+            "path": "26ss/Course/video.mp4",
+            "content_hash": "a" * 64,
+            "size": 1,
+        },
+    ],
+)
+def test_invalid_cached_download_artifact_is_not_trusted(artifact):
+    node = course_cache.node_from_cache_data(
+        {
+            "name": "Video",
+            "type": "Youtube",
+            "url": "https://youtu.be/abcdefghijk",
+            "download_kind": "youtube",
+            "download_status": "handled",
+            "artifact": artifact,
+            "children": [],
+        }
+    )
+
+    assert node.artifact is None
+
+
 def test_failed_course_fetch_preserves_previous_course_cache(tmp_path, monkeypatch):
     config = {"paths.sync_directory": str(tmp_path)}
     cached_context = make_context(config)

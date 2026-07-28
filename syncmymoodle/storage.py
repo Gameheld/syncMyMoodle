@@ -38,6 +38,10 @@ class FileSnapshot:
             "sha256": self.digest,
         }.get(algorithm)
 
+    @property
+    def size(self) -> int | None:
+        return self.identity[2] if self.identity is not None else None
+
     def still_matches(self, path: Path) -> bool:
         """Verify that both metadata and content still match the snapshot."""
         if not self.metadata_still_matches(path):

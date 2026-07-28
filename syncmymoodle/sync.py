@@ -6,11 +6,11 @@ from dataclasses import dataclass
 from pathlib import PurePosixPath
 from typing import Any
 
-from syncmymoodle import course_cache, filters, links, pathing, sync_handlers
+from syncmymoodle import artifacts, course_cache, filters, pathing, sync_handlers
 from syncmymoodle import moodle as moodle_api
 from syncmymoodle.context import SyncContext
-from syncmymoodle.http_utils import canonical_remote_url, redact_url_secrets
-from syncmymoodle.node import DownloadKind, Node, NodeKind
+from syncmymoodle.http_utils import redact_url_secrets
+from syncmymoodle.node import Node, NodeKind
 from syncmymoodle.outcomes import FailureCode, RemovedContent, classify_exception
 from syncmymoodle.pathing import sanitized_node_path_parts
 
@@ -65,31 +65,13 @@ def _course_inventory_scope(ctx: SyncContext, course_id: int) -> str:
     return hashlib.sha256(encoded).hexdigest()
 
 
-def _remote_content_identity(node: Node) -> tuple[str, str] | None:
-    """Return a stable comparison key and a safe user-visible identity."""
-    if not node.url:
-        return None
-    youtube_id = links.youtube_video_id_from_node(node)
-    if youtube_id is not None:
-        identity = f"youtube:{youtube_id}"
-        return identity, identity
-    identity_url, display_url = canonical_remote_url(node.url)
-    if node.download_kind is DownloadKind.OPENCAST:
-        identity = f"opencast:{node.id}:{identity_url.partition('?')[0]}"
-        return identity, identity
-    if node.download_kind in {DownloadKind.EMEDIA, DownloadKind.QUIZ} and node.id:
-        identity = f"{node.download_kind}:{node.id}"
-        return identity, identity
-    return f"{node.download_kind}:{identity_url}", display_url
-
-
 def _remote_content_nodes(root: Node) -> dict[str, list[tuple[Node, str]]]:
     nodes: dict[str, list[tuple[Node, str]]] = {}
     pending = [root]
     while pending:
         node = pending.pop()
         pending.extend(node.children)
-        identity = _remote_content_identity(node)
+        identity = artifacts.remote_content_identity(node)
         if identity is not None:
             key, display = identity
             nodes.setdefault(key, []).append((node, display))

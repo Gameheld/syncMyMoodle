@@ -115,6 +115,7 @@ class VerifiedDownloadArtifact:
     path: Path
     content_hash: str
     size: int
+    remote_identity: str
 
 
 @dataclass

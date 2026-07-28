@@ -28,6 +28,7 @@ Sync tree:
     sync_handlers   per-module-type handlers and explicit module dispatch
 
 Download:
+    artifacts       stable remote identities and complete local artifact state
     downloader      tree walk, update/conflict policy, ETag/resume handling
     quiz            quiz review HTML snapshots and Chromium PDF rendering
 

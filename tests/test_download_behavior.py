@@ -58,6 +58,20 @@ def sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
+def write_youtube_fixture(options, content=b"video"):
+    template = os.fspath(options["outtmpl"])
+    if template.startswith("\\\\?\\"):
+        template = template[4:]
+    output = Path(
+        template.replace("%(title)s", "Lecture")
+        .replace("%(id)s", "abcdefghijk")
+        .replace("%(ext)s", "mp4")
+    )
+    output.parent.mkdir(parents=True, exist_ok=True)
+    output.write_bytes(content)
+    return output
+
+
 def test_classify_local_file_is_tristate(tmp_path):
     from syncmymoodle.downloader import FileMatch, classify_local_file
 
@@ -377,7 +391,7 @@ def test_youtube_outtmpl_applies_windows_prefix_after_template_suffix(
 
         def download(self, links):
             captured["links"] = links
-            (download_directory / "Lecture-abcdefghijk.mp4").write_bytes(b"video")
+            write_youtube_fixture(captured["opts"])
 
     monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", FakeYoutubeDL)
     ctx = make_context({"paths.sync_directory": str(tmp_path)})
@@ -392,7 +406,6 @@ def test_youtube_outtmpl_applies_windows_prefix_after_template_suffix(
         download_kind=DownloadKind.YOUTUBE,
     )
     assert node is not None
-    download_directory = node_path(ctx, section)
 
     assert downloader.scan_and_download_youtube(ctx, node).is_handled
 
@@ -422,7 +435,7 @@ def test_youtube_partial_file_does_not_block_resume(tmp_path, monkeypatch):
 
         def download(self, urls):
             downloads.append(urls)
-            (video_path / "Lecture-abcdefghijk.mp4").write_bytes(b"video")
+            write_youtube_fixture(self.opts)
 
     monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", FakeYoutubeDL)
 
@@ -571,6 +584,113 @@ def build_youtube_tree(link):
     return root, section, video
 
 
+def cache_youtube_fixture(tmp_path, monkeypatch, content=b"original video"):
+    calls = []
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def download(self, urls):
+            calls.append(urls)
+            write_youtube_fixture(self.options, content)
+            return 0
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    config = {
+        "paths.sync_directory": str(tmp_path),
+        "downloads.update_files": True,
+        "downloads.conflict_handling": "rename",
+    }
+    ctx = make_context(config)
+    root, section, video = build_youtube_tree("https://youtu.be/abcdefghijk")
+    ctx.root_node = root
+
+    downloader.download_node_tree(ctx, root)
+    course_cache.cache_root_node(ctx)
+
+    assert calls == [["https://www.youtube.com/watch?v=abcdefghijk"]]
+    assert video.artifact is not None
+    output = node_path(ctx, section) / "Lecture-abcdefghijk.mp4"
+    assert output.read_bytes() == content
+    return config, output, video.artifact
+
+
+def test_youtube_cache_records_and_verifies_exact_artifact(
+    tmp_path,
+    monkeypatch,
+):
+    config, output, cached_artifact = cache_youtube_fixture(tmp_path, monkeypatch)
+
+    class UnexpectedYoutubeDL:
+        def __init__(self, options):
+            raise AssertionError(f"verified artifact must not invoke yt-dlp: {options}")
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", UnexpectedYoutubeDL)
+    current = make_context(config)
+    root, _, video = build_youtube_tree("https://youtu.be/abcdefghijk")
+    current.root_node = root
+
+    downloader.download_node_tree(current, root)
+
+    assert output.read_bytes() == b"original video"
+    assert video.artifact == cached_artifact
+    assert video.artifact.path.endswith("/General/Lecture-abcdefghijk.mp4")
+    assert video.artifact.content_hash == sha256(b"original video")
+    assert video.artifact.size == len(b"original video")
+    assert video.artifact.remote_identity == "youtube:abcdefghijk"
+    assert current.stats.unchanged == 1
+
+
+def test_corrupt_youtube_artifact_uses_normal_conflict_install(
+    tmp_path,
+    monkeypatch,
+):
+    config, output, _ = cache_youtube_fixture(tmp_path, monkeypatch)
+    output.write_bytes(b"corrupt local bytes")
+    calls = []
+
+    class FakeYoutubeDL:
+        def __init__(self, options):
+            self.options = options
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def download(self, urls):
+            calls.append(urls)
+            write_youtube_fixture(self.options, b"fresh video")
+            return 0
+
+    monkeypatch.setattr(downloader.yt_dlp, "YoutubeDL", FakeYoutubeDL)
+    current = make_context(config)
+    root, _, video = build_youtube_tree("https://youtu.be/abcdefghijk")
+    current.root_node = root
+
+    downloader.download_node_tree(current, root)
+
+    assert calls == [["https://www.youtube.com/watch?v=abcdefghijk"]]
+    assert output.read_bytes() == b"fresh video"
+    conflicts = list(output.parent.glob("*.syncconflict.*"))
+    assert len(conflicts) == 1
+    assert conflicts[0].read_bytes() == b"corrupt local bytes"
+    assert video.artifact is not None
+    assert video.artifact.path.endswith("/General/Lecture-abcdefghijk.mp4")
+    assert video.artifact.content_hash == sha256(b"fresh video")
+    assert video.artifact.size == len(b"fresh video")
+    assert current.stats.updated == 1
+    assert not list(tmp_path.glob(".smm-youtube-*"))
+
+
 def test_existing_youtube_download_is_marked_handled(tmp_path):
     ctx = make_context({"paths.sync_directory": str(tmp_path)})
     root, section, video = build_youtube_tree("https://youtu.be/abcdefghijk")
@@ -665,6 +785,12 @@ def test_download_streams_chunks_to_disk_and_records_metadata(tmp_path, capsys):
     assert int(download_path.stat().st_mtime) == 1710000500
     # The ETag is persisted on the node for the next run's change detection.
     assert file_node.etag == etag
+    artifact = file_node.artifact
+    assert artifact is not None
+    assert artifact.path == "26ss/Download Course/General/slides.pdf"
+    assert artifact.content_hash == sha256(b"".join(chunks))
+    assert artifact.size == len(b"".join(chunks))
+    assert artifact.remote_identity == f"direct:{URL}"
     assert syncer.session.count("GET", URL) == 1
     assert outcome.downloaded == 1
     assert outcome.transferred_bytes == len(b"".join(chunks))

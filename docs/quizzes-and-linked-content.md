@@ -153,9 +153,11 @@ The output name includes the video title and stable video ID.
 Important behavior:
 
 - Live streams are excluded.
-- Existing output files are not blindly overwritten by yt-dlp.
-- Normal syncMyMoodle update and conflict policy still governs managed targets
-  where source metadata supports it.
+- yt-dlp writes into a private staging directory instead of directly replacing
+  an existing output.
+- The completed output path, SHA-256, byte size, and YouTube identity are cached.
+- Later runs verify that exact artifact and apply normal update and conflict
+  policy if it is missing or its bytes changed.
 - YouTube extraction can change as the service changes; use a current supported
   yt-dlp version.
 

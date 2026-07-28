@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+from dataclasses import dataclass
 from enum import StrEnum
+from pathlib import PurePosixPath
 from typing import Any
 
 NAME_CLASH_ID_UNSET = object()
@@ -34,6 +36,67 @@ class NodeKind(StrEnum):
     SEMESTER = "Semester"
     COURSE = "Course"
     SECTION = "Section"
+
+
+@dataclass(frozen=True)
+class DownloadArtifact:
+    """Complete local state for one downloaded remote artifact."""
+
+    path: str
+    content_hash: str
+    size: int
+    remote_identity: str
+
+    def __post_init__(self) -> None:
+        portable_path = PurePosixPath(self.path) if isinstance(self.path, str) else None
+        if (
+            portable_path is None
+            or not self.path
+            or "\\" in self.path
+            or portable_path.is_absolute()
+            or ".." in portable_path.parts
+            or portable_path.as_posix() != self.path
+            or not isinstance(self.content_hash, str)
+            or len(self.content_hash) != 64
+            or any(
+                character not in "0123456789abcdef" for character in self.content_hash
+            )
+            or not isinstance(self.size, int)
+            or isinstance(self.size, bool)
+            or self.size < 0
+            or not isinstance(self.remote_identity, str)
+            or not self.remote_identity
+        ):
+            raise ValueError("invalid downloaded artifact metadata")
+
+    @classmethod
+    def from_value(cls, value: Any) -> DownloadArtifact | None:
+        if isinstance(value, cls):
+            return value
+        if not isinstance(value, dict) or set(value) != {
+            "path",
+            "content_hash",
+            "size",
+            "remote_identity",
+        }:
+            return None
+        try:
+            return cls(
+                value["path"],
+                value["content_hash"],
+                value["size"],
+                value["remote_identity"],
+            )
+        except (TypeError, ValueError):
+            return None
+
+    def to_cache_data(self) -> dict[str, str | int]:
+        return {
+            "path": self.path,
+            "content_hash": self.content_hash,
+            "size": self.size,
+            "remote_identity": self.remote_identity,
+        }
 
 
 def _remote_marker_kind(
@@ -100,6 +163,7 @@ class Node:
         etag: str | None = None,
         etag_kind: RemoteMarkerKind | str | None = None,
         content_hash: str | None = None,
+        artifact: DownloadArtifact | dict[str, Any] | None = None,
         artifact_hashes: dict[str, str] | None = None,
         remote_size: Any = None,
         name_clash_id: Any = NAME_CLASH_ID_UNSET,
@@ -119,7 +183,12 @@ class Node:
         # A content hash (sha256 hex) we compute from the bytes we downloaded.
         # Unlike etag, which for Sciebo/WebDAV is an opaque revision token, this
         # is a real hash of our copy, used to detect local user modifications.
-        self.content_hash = content_hash
+        self.artifact = DownloadArtifact.from_value(artifact)
+        self._legacy_content_hash = (
+            content_hash
+            if self.artifact is None and isinstance(content_hash, str)
+            else None
+        )
         self.artifact_hashes = _artifact_hashes(artifact_hashes)
         self.remote_size = _optional_int(remote_size)
         self.name_clash_id = (
@@ -144,6 +213,21 @@ class Node:
     @property
     def is_verified(self) -> bool:
         return self.download_status == DownloadStatus.HANDLED
+
+    @property
+    def content_hash(self) -> str | None:
+        if self.artifact is not None:
+            return self.artifact.content_hash
+        return self._legacy_content_hash
+
+    @content_hash.setter
+    def content_hash(self, value: str | None) -> None:
+        self.artifact = None
+        self._legacy_content_hash = value
+
+    def record_artifact(self, artifact: DownloadArtifact) -> None:
+        self.artifact = artifact
+        self._legacy_content_hash = None
 
     @property
     def has_remote_marker_conflict(self) -> bool:
@@ -295,7 +379,8 @@ class Node:
             timemodified=self.timemodified,
             etag=self.etag,
             etag_kind=self.etag_kind,
-            content_hash=self.content_hash,
+            content_hash=self._legacy_content_hash,
+            artifact=self.artifact,
             artifact_hashes=self.artifact_hashes,
             remote_size=self.remote_size,
             name_clash_id=self.name_clash_id,

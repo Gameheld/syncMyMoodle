@@ -4,6 +4,7 @@ import math
 import os
 import re
 import shutil
+import tempfile
 import urllib.parse
 from contextlib import closing
 from dataclasses import dataclass
@@ -15,7 +16,16 @@ from typing import Any, TypeGuard
 import requests
 import yt_dlp
 
-from syncmymoodle import course_cache, filters, links, opencast, pathing, quiz, storage
+from syncmymoodle import (
+    artifacts,
+    course_cache,
+    filters,
+    links,
+    opencast,
+    pathing,
+    quiz,
+    storage,
+)
 from syncmymoodle.constants import (
     DEFAULT_BLOCK_SIZE,
     HASH_ALGOS_BY_LENGTH,
@@ -55,7 +65,7 @@ from syncmymoodle.outcomes import (
     completed_download,
     failed_download,
 )
-from syncmymoodle.output import TransferProgress, format_size
+from syncmymoodle.output import TrackedAction, TransferProgress, format_size
 
 logger = logging.getLogger(__name__)
 CONTENT_RANGE_RE = re.compile(
@@ -136,6 +146,13 @@ class TransferPlan:
 class PlannedTransfer:
     action: ConflictAction
     baseline: storage.FileSnapshot
+
+
+@dataclass(frozen=True)
+class VerifiedFile:
+    path: Path
+    content_hash: str
+    size: int
 
 
 class YtDlpLogger:
@@ -769,15 +786,42 @@ def stable_download_decision(
     return decision, baseline
 
 
+def verified_file(path: Path) -> VerifiedFile | None:
+    snapshot = storage.snapshot_file(path)
+    if (
+        snapshot.digest is None
+        or snapshot.size is None
+        or not snapshot.metadata_still_matches(path)
+    ):
+        return None
+    return VerifiedFile(path, snapshot.digest, snapshot.size)
+
+
 def record_unchanged_copy(
+    ctx: SyncContext,
     node: Node,
     downloadpath: Path,
     decision: DownloadDecision,
     baseline: storage.FileSnapshot,
 ) -> DownloadOutcome:
-    if decision is DownloadDecision.ADOPT:
-        assert baseline.digest is not None
-        node.content_hash = baseline.digest
+    old_node = course_cache.get_old_node_for(ctx, node)
+    old_hash = local_verification_marker(old_node)
+    if (
+        baseline.digest is not None
+        and baseline.size is not None
+        and (
+            decision is DownloadDecision.ADOPT
+            or classify_local_file(downloadpath, old_hash, baseline) is FileMatch.MATCH
+        )
+    ):
+        record_verified_download(
+            ctx,
+            node,
+            downloadpath,
+            None,
+            baseline.digest,
+            baseline.size,
+        )
     if (
         node.etag_kind is RemoteMarkerKind.CONTENT_HASH
         and classify_local_file(downloadpath, node.etag, baseline) is FileMatch.MATCH
@@ -819,7 +863,7 @@ def planned_download_action(
     if decision is DownloadDecision.POLICY_SKIP:
         return POLICY_SKIPPED_DOWNLOAD
     if decision in {DownloadDecision.ADOPT, DownloadDecision.SKIP}:
-        return record_unchanged_copy(node, downloadpath, decision, baseline)
+        return record_unchanged_copy(ctx, node, downloadpath, decision, baseline)
     action = (
         conflict_action(ctx, downloadpath, log)
         if decision is DownloadDecision.CONFLICT
@@ -1045,13 +1089,10 @@ def validate_staged_download(
     transfer: TransferPlan,
     downloadpath: Path,
     log: logging.Logger,
-) -> str | None:
-    """Return the staged SHA-256 after validating all advertised integrity data."""
+) -> VerifiedFile | None:
+    """Return a stable staged snapshot after validating advertised integrity."""
     snapshot = storage.snapshot_file(transfer.tmp_path)
-    try:
-        actual_size = transfer.tmp_path.stat().st_size
-    except OSError:
-        actual_size = None
+    actual_size = snapshot.size
     expected_sizes = expected_staged_sizes(node, response, transfer)
     if (
         actual_size is None
@@ -1086,7 +1127,8 @@ def validate_staged_download(
             )
             transfer.discard_partial()
             return None
-    return snapshot.digest
+    assert snapshot.digest is not None and actual_size is not None
+    return VerifiedFile(transfer.tmp_path, snapshot.digest, actual_size)
 
 
 def install_downloaded_file(
@@ -1102,7 +1144,7 @@ def install_downloaded_file(
         baseline=planned.baseline,
         rename_local=planned.action is ConflictAction.RENAME_LOCAL,
         target_change_policy=target_change_policy,
-        description="the updated file from Moodle",
+        description="the updated download",
         log=log,
     )
     transfer.discard_partial()
@@ -1125,41 +1167,37 @@ def noninstalled_download_outcome(
     return failed_download(FailureCode.LOCAL_STORAGE)
 
 
-def record_download_metadata(
-    node: Node,
-    downloadpath: Path,
-    etag_header: str | None,
-    content_hash: str | None = None,
-) -> None:
-    node.content_hash = content_hash or storage.file_sha256(downloadpath)
-
-    align_mtime_with_timemodified(node, downloadpath)
-
-    if etag_header is not None and node.etag is None:
-        node.etag = etag_header
-        node.etag_kind = RemoteMarkerKind.OPAQUE
-
-
 def record_verified_download(
     ctx: SyncContext,
     node: Node,
     downloadpath: Path,
     etag_header: str | None,
     content_hash: str,
+    size: int,
 ) -> None:
-    record_download_metadata(node, downloadpath, etag_header, content_hash)
+    if etag_header is not None and node.etag is None:
+        node.etag = etag_header
+        node.etag_kind = RemoteMarkerKind.OPAQUE
+    artifact = artifacts.download_artifact(
+        ctx,
+        node,
+        downloadpath,
+        content_hash,
+        size,
+    )
+    node.record_artifact(artifact)
+    if node.remote_size is None:
+        node.remote_size = size
+    align_mtime_with_timemodified(node, downloadpath)
     ctx.downloaded_paths.add(downloadpath)
     key = transfer_reuse_key(node)
     if key is None:
-        return
-    try:
-        size = downloadpath.stat().st_size
-    except OSError:
         return
     ctx.verified_download_artifacts[key] = VerifiedDownloadArtifact(
         downloadpath,
         content_hash,
         size,
+        artifact.remote_identity,
     )
 
 
@@ -1228,8 +1266,9 @@ def record_reused_download(
     node: Node,
     downloadpath: Path,
     content_hash: str,
+    size: int,
 ) -> None:
-    record_verified_download(ctx, node, downloadpath, None, content_hash)
+    record_verified_download(ctx, node, downloadpath, None, content_hash, size)
     # A complete verified copy makes any older resumable transfer obsolete.
     prepare_transfer_plan(node, downloadpath).discard_partial()
 
@@ -1252,7 +1291,13 @@ def install_reusable_artifact(
         downloadpath
     ):
         transfer.discard_partial()
-        record_reused_download(ctx, node, downloadpath, artifact.content_hash)
+        record_reused_download(
+            ctx,
+            node,
+            downloadpath,
+            artifact.content_hash,
+            artifact.size,
+        )
         return UNCHANGED_DOWNLOAD
 
     install_result = install_downloaded_file(
@@ -1265,7 +1310,13 @@ def install_reusable_artifact(
     install_outcome = noninstalled_download_outcome(install_result, 0)
     if install_outcome is not None:
         return install_outcome
-    record_reused_download(ctx, node, downloadpath, artifact.content_hash)
+    record_reused_download(
+        ctx,
+        node,
+        downloadpath,
+        artifact.content_hash,
+        artifact.size,
+    )
     return completed_download(existed=baseline.exists)
 
 
@@ -1279,6 +1330,11 @@ def prepare_download_or_reuse(
     """Apply local policy and reuse a verified transfer before requesting it."""
     key = None if ctx.config.dry_run else transfer_reuse_key(node)
     artifact = ctx.verified_download_artifacts.get(key) if key is not None else None
+    identity = artifacts.remote_content_identity(node)
+    if artifact is not None and (
+        identity is None or artifact.remote_identity != identity[0]
+    ):
+        artifact = None
     if artifact is not None and node.remote_size not in (None, artifact.size):
         artifact = None
     if artifact is not None and node.remote_size is None:
@@ -1359,15 +1415,16 @@ def process_download_response(
             first_chunk,
             total_size=node.remote_size if response_size is None else response_size,
         )
-        staged_hash = validate_staged_download(
+        staged = validate_staged_download(
             node,
             response,
             transfer,
             downloadpath,
             log,
         )
-        if staged_hash is None:
+        if staged is None:
             return FAILED_DOWNLOAD
+        staged_hash = staged.content_hash
         local_hash = (
             storage.file_sha256(downloadpath) if downloadpath.exists() else None
         )
@@ -1379,6 +1436,7 @@ def process_download_response(
                 downloadpath,
                 etag_header,
                 staged_hash,
+                staged.size,
             )
             action.complete("Unchanged")
             return DownloadOutcome(
@@ -1398,7 +1456,14 @@ def process_download_response(
         )
         if install_outcome is not None:
             return install_outcome
-        record_verified_download(ctx, node, downloadpath, etag_header, staged_hash)
+        record_verified_download(
+            ctx,
+            node,
+            downloadpath,
+            etag_header,
+            staged_hash,
+            staged.size,
+        )
         action.complete("Downloaded")
         return completed_download(existed=existed, transferred_bytes=transferred_bytes)
 
@@ -1621,6 +1686,28 @@ def download_node_tree(
         progress.finish_item(index)
 
 
+def verified_yt_dlp_file(
+    result: Any,
+    path: Path | None,
+    description: str,
+    log: logging.Logger,
+) -> VerifiedFile | FailureCode:
+    if result not in (None, 0) or path is None or not path.is_file():
+        log.warning("yt-dlp did not download %s", description)
+        return FailureCode.NETWORK_PROVIDER
+    artifact = verified_file(path)
+    if artifact is None:
+        log.warning("yt-dlp produced an unreadable %s", description)
+        return FailureCode.LOCAL_STORAGE
+    return artifact
+
+
+def yt_dlp_failure_outcome(code: FailureCode, log: logging.Logger) -> DownloadOutcome:
+    if code is FailureCode.NETWORK_PROVIDER:
+        log_yt_dlp_failure(log)
+    return failed_download(code)
+
+
 def download_emedia_video(
     ctx: SyncContext,
     node: Node,
@@ -1672,10 +1759,14 @@ def download_emedia_video(
             temporary_path.unlink(missing_ok=True)
             with progress:
                 result = ydl.download([node.url])
-            if result not in (None, 0) or not temporary_path.is_file():
-                log.warning("yt-dlp did not download VEIRA video %s", node.id)
-                log_yt_dlp_failure(log)
-                return FAILED_DOWNLOAD
+            staged = verified_yt_dlp_file(
+                result,
+                temporary_path,
+                f"VEIRA video {node.id}",
+                log,
+            )
+            if isinstance(staged, FailureCode):
+                return yt_dlp_failure_outcome(staged, log)
 
             transfer = TransferPlan(
                 temporary_path,
@@ -1695,8 +1786,14 @@ def download_emedia_video(
             )
             if install_outcome is not None:
                 return install_outcome
-            record_download_metadata(node, downloadpath, None)
-            ctx.downloaded_paths.add(downloadpath)
+            record_verified_download(
+                ctx,
+                node,
+                downloadpath,
+                None,
+                staged.content_hash,
+                staged.size,
+            )
             action.complete("Downloaded")
             return completed_download(
                 existed=existed,
@@ -1704,15 +1801,180 @@ def download_emedia_video(
             )
 
 
-def youtube_download_exists(path: Path, video_id: str | None) -> bool:
+def youtube_artifact_path(path: Path, video_id: str | None) -> Path | None:
     if not video_id or not path.is_dir():
-        return False
+        return None
     completed_name = re.compile(rf"-{re.escape(video_id)}\.[^.]+$")
-    return any(
-        file.is_file()
+    candidates = sorted(
+        file
+        for file in path.iterdir()
+        if file.is_file()
         and file.suffix.casefold() not in YOUTUBE_AUXILIARY_EXTENSIONS
         and completed_name.search(file.name)
-        for file in path.iterdir()
+    )
+    return candidates[0] if len(candidates) == 1 else None
+
+
+def _cached_youtube_action(
+    ctx: SyncContext,
+    node: Node,
+    target: Path,
+    log: logging.Logger,
+) -> PlannedTransfer | DownloadOutcome:
+    old_node = course_cache.get_old_node_for(ctx, node, log)
+    assert old_node is not None and old_node.artifact is not None
+    baseline = storage.snapshot_file(target)
+    artifact = old_node.artifact
+    if (
+        baseline.digest == artifact.content_hash
+        and baseline.size == artifact.size
+        and baseline.still_matches(target)
+    ):
+        record_verified_download(
+            ctx,
+            node,
+            target,
+            None,
+            artifact.content_hash,
+            artifact.size,
+        )
+        return UNCHANGED_DOWNLOAD
+    if not baseline.exists:
+        return PlannedTransfer(ConflictAction.DOWNLOAD, baseline)
+    if not ctx.config.update_files:
+        return POLICY_SKIPPED_DOWNLOAD
+    action = conflict_action(ctx, target, log)
+    if action is ConflictAction.SKIP:
+        return POLICY_SKIPPED_DOWNLOAD
+    return PlannedTransfer(action, baseline)
+
+
+def _prepare_youtube_target(
+    ctx: SyncContext,
+    node: Node,
+    directory: Path,
+    video_id: str,
+    log: logging.Logger,
+) -> tuple[Path | None, PlannedTransfer | DownloadOutcome | None]:
+    old_node = course_cache.get_old_node_for(ctx, node, log)
+    identity = artifacts.remote_content_identity(node)
+    if (
+        old_node is not None
+        and old_node.artifact is not None
+        and identity is not None
+        and old_node.artifact.remote_identity == identity[0]
+    ):
+        target = artifacts.resolve_artifact_path(ctx, old_node.artifact)
+        if target is not None:
+            node.remote_size = old_node.remote_size or old_node.artifact.size
+            return target, _cached_youtube_action(ctx, node, target, log)
+
+    target = youtube_artifact_path(directory, video_id)
+    if target is None:
+        return None, None
+    artifact = verified_file(target)
+    if artifact is not None:
+        record_verified_download(
+            ctx,
+            node,
+            target,
+            None,
+            artifact.content_hash,
+            artifact.size,
+        )
+        return target, UNCHANGED_DOWNLOAD
+    return target, planned_download_action(ctx, node, target, log)
+
+
+def _install_youtube_stage(
+    ctx: SyncContext,
+    node: Node,
+    result: Any,
+    output_directory: Path,
+    video_id: str,
+    target_directory: Path,
+    target_path: Path | None,
+    planned: PlannedTransfer | None,
+    progress: TransferProgress,
+    action: TrackedAction,
+    log: logging.Logger,
+) -> DownloadOutcome:
+    staged_path = youtube_artifact_path(output_directory, video_id)
+    staged = verified_yt_dlp_file(
+        result,
+        staged_path,
+        f"YouTube video {video_id}",
+        log,
+    )
+    if isinstance(staged, FailureCode):
+        return yt_dlp_failure_outcome(staged, log)
+
+    if target_path is None:
+        target_path = pathing.with_windows_extended_length_prefix(
+            target_directory / staged.path.name
+        )
+        action_or_outcome = planned_download_action(
+            ctx,
+            node,
+            target_path,
+            log,
+        )
+        if isinstance(action_or_outcome, DownloadOutcome):
+            return action_or_outcome
+        planned = action_or_outcome
+    assert planned is not None
+
+    baseline = planned.baseline
+    if (
+        baseline.digest == staged.content_hash
+        and baseline.size == staged.size
+        and baseline.still_matches(target_path)
+    ):
+        record_verified_download(
+            ctx,
+            node,
+            target_path,
+            None,
+            staged.content_hash,
+            staged.size,
+        )
+        action.complete("Unchanged YouTube video")
+        return DownloadOutcome(
+            unchanged=1,
+            transferred_bytes=progress.transferred_bytes,
+        )
+
+    target_path.parent.mkdir(parents=True, exist_ok=True)
+    transfer = TransferPlan(
+        staged.path,
+        staged.path.with_name(staged.path.name + ".etag"),
+        {},
+    )
+    install_result = install_downloaded_file(
+        target_path,
+        transfer,
+        planned,
+        ctx.config.conflict_handling,
+        log,
+    )
+    install_outcome = noninstalled_download_outcome(
+        install_result,
+        progress.transferred_bytes,
+    )
+    if install_outcome is not None:
+        return install_outcome
+    record_verified_download(
+        ctx,
+        node,
+        target_path,
+        None,
+        staged.content_hash,
+        staged.size,
+    )
+    action.complete("Downloaded YouTube video")
+    return completed_download(
+        existed=baseline.exists,
+        transferred_bytes=progress.transferred_bytes,
     )
 
 
@@ -1722,7 +1984,8 @@ def scan_and_download_youtube(
     log: logging.Logger = logger,
 ) -> DownloadOutcome:
     """Download Youtube-Videos using yt_dlp."""
-    if node.parent is None or node.url is None:
+    video_id = links.youtube_video_id_from_node(node)
+    if node.parent is None or node.url is None or video_id is None:
         return failed_download(FailureCode.INTERNAL)
     path = pathing.get_sanitized_node_path(node.parent, Path(ctx.config.sync_directory))
     link = node.url
@@ -1736,21 +1999,39 @@ def scan_and_download_youtube(
         inventory=False,
     ):
         return SKIPPED_DOWNLOAD
-    video_id = links.youtube_video_id_from_node(node)
-    if youtube_download_exists(path, video_id):
-        return UNCHANGED_DOWNLOAD
+    target_path, action_or_outcome = _prepare_youtube_target(
+        ctx,
+        node,
+        path,
+        video_id,
+        log,
+    )
+    if isinstance(action_or_outcome, DownloadOutcome):
+        return action_or_outcome
+    planned = action_or_outcome
+    report_target: str | Path = target_path or f"{link} to {path}"
     if ctx.config.dry_run and not size_limits_configured(ctx):
         return report_planned_download(
             ctx,
-            f"{link} to {path}",
+            report_target,
             "Youtube",
             verb="Would download YouTube video",
         )
-    if cached_yt_dlp_size_violates_limit(ctx, node, path, log):
+    if cached_yt_dlp_size_violates_limit(ctx, node, target_path or path, log):
         return SKIPPED_DOWNLOAD
+
+    stage_directory: Path | None = None
+    if not ctx.config.dry_run:
+        ctx.internal_path_root.root.mkdir(parents=True, exist_ok=True)
+        stage_directory = Path(
+            tempfile.mkdtemp(
+                prefix=f".smm-youtube-{video_id}-",
+                dir=ctx.internal_path_root.root,
+            )
+        )
+    output_directory = stage_directory or path
     outtmpl = pathing.with_windows_extended_length_prefix(
-        path / "%(title)s-%(id)s.%(ext)s",
-        force=True,
+        output_directory / "%(title)s-%(id)s.%(ext)s", force=True
     )
     progress = ctx.output.transfer(node.remote_size)
     ydl_opts: dict[str, Any] = {
@@ -1761,37 +2042,40 @@ def scan_and_download_youtube(
         "match_filter": yt_dlp.match_filter_func("!is_live"),
         **yt_dlp_output_options(log, progress),
     }
-    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-        if yt_dlp_violates_size_limits(ctx, ydl, node, link, "YouTube video"):
-            return SKIPPED_DOWNLOAD
-        if ctx.config.dry_run:
-            return report_planned_download(
-                ctx,
-                f"{link} to {path}",
-                "Youtube",
-                verb="Would download YouTube video",
-            )
-        target = f"{link} to {path}"
-        with ctx.output.tracked_action(
-            "Downloading YouTube video", target, "Youtube"
-        ) as action:
-            path.mkdir(parents=True, exist_ok=True)
-            with progress:
-                result = ydl.download([link])
-            if result not in (None, 0):
-                log_yt_dlp_failure(log)
-                return FAILED_DOWNLOAD
-            if not youtube_download_exists(path, video_id):
-                log.warning(
-                    "yt-dlp did not download YouTube video %s; it may have been filtered",
-                    video_id or link,
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            if yt_dlp_violates_size_limits(ctx, ydl, node, link, "YouTube video"):
+                return SKIPPED_DOWNLOAD
+            if ctx.config.dry_run:
+                return report_planned_download(
+                    ctx,
+                    report_target,
+                    "Youtube",
+                    verb="Would download YouTube video",
                 )
-                return FAILED_DOWNLOAD
-            action.complete("Downloaded YouTube video")
-            return completed_download(
-                existed=False,
-                transferred_bytes=progress.transferred_bytes,
-            )
+            with ctx.output.tracked_action(
+                "Downloading YouTube video",
+                report_target,
+                "Youtube",
+            ) as action:
+                with progress:
+                    result = ydl.download([link])
+                return _install_youtube_stage(
+                    ctx,
+                    node,
+                    result,
+                    output_directory,
+                    video_id,
+                    path,
+                    target_path,
+                    planned,
+                    progress,
+                    action,
+                    log,
+                )
+    finally:
+        if stage_directory is not None:
+            shutil.rmtree(stage_directory, ignore_errors=True)
 
 
 def cached_yt_dlp_size_violates_limit(
@@ -1801,9 +2085,18 @@ def cached_yt_dlp_size_violates_limit(
     log: logging.Logger = logger,
 ) -> bool:
     old_node = course_cache.get_old_node_for(ctx, node, log)
-    if old_node is None or not old_node.is_verified or old_node.remote_size is None:
+    if old_node is None or not old_node.is_verified:
         return False
-    node.remote_size = old_node.remote_size
+    known_size = (
+        old_node.remote_size
+        if old_node.remote_size is not None
+        else old_node.artifact.size
+        if old_node.artifact is not None
+        else None
+    )
+    if known_size is None:
+        return False
+    node.remote_size = known_size
     return known_remote_size_violates_limit(ctx, node, path)
 
 

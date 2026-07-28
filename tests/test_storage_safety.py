@@ -10,8 +10,8 @@ from types import SimpleNamespace
 import pytest
 import requests
 
-from syncmymoodle import pathing
-from syncmymoodle.node import Node
+from syncmymoodle import artifacts, pathing
+from syncmymoodle.node import DownloadArtifact, Node
 from syncmymoodle.pathing import (
     PATH_COMPONENT_MAX_BYTES,
     format_conflict_path,
@@ -123,6 +123,18 @@ def test_windows_extended_length_path_formats_drive_and_unc_paths():
         windows_extended_length_path(r"\\?\C:\Moodle\Course\file.pdf")
         == r"\\?\C:\Moodle\Course\file.pdf"
     )
+
+
+def test_artifact_path_round_trip_handles_windows_extended_prefix(tmp_path):
+    ctx = make_context({"paths.sync_directory": str(tmp_path)})
+    target = tmp_path / "Course" / "video.mp4"
+    extended_target = Path(windows_extended_length_path(os.fspath(target)))
+
+    relative = artifacts.relative_artifact_path(ctx, extended_target)
+    artifact = DownloadArtifact(relative, "a" * 64, 1, "youtube:abcdefghijk")
+
+    assert relative == "Course/video.mp4"
+    assert artifacts.resolve_artifact_path(ctx, artifact) == target
 
 
 def test_user_config_dir_uses_xdg_override(tmp_path, monkeypatch):

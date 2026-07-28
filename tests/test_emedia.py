@@ -67,6 +67,27 @@ def test_extract_video_id_rejects_non_video_links(link):
     assert emedia.extract_video_id(link) is None
 
 
+def test_emedia_cache_matching_uses_remote_identity_across_title_changes():
+    old_parent = Node("Section", 1, "Section", None)
+    old_video = old_parent.add_child(
+        "Old title.mp4",
+        540,
+        "Emedia",
+        url=PLAYLIST_URL,
+        download_kind=DownloadKind.EMEDIA,
+    )
+    current_parent = Node("Section", 1, "Section", None)
+    current_video = current_parent.add_child(
+        "New title.mp4",
+        540,
+        "Emedia",
+        url=PLAYLIST_URL,
+        download_kind=DownloadKind.EMEDIA,
+    )
+
+    assert course_cache.match_old_cache_child(old_parent, current_video) is old_video
+
+
 def test_single_emedia_link_resolves_public_api_without_login(monkeypatch):
     link = "https://emedia-medizin.rwth-aachen.de/web/veira_fe/#/watch/540"
     api_session = FakeSession()
@@ -371,6 +392,11 @@ def test_emedia_download_uses_best_stream_and_exact_node_name(
     assert Path(captured["opts"]["outtmpl"]).name == temporary_filename
     assert captured["opts"].get("fixup") == expected_fixup
     assert video.is_handled
+    assert video.artifact is not None
+    assert video.artifact.path == f"Section/{filename}"
+    assert video.artifact.content_hash == hashlib.sha256(b"video bytes").hexdigest()
+    assert video.artifact.size == len(b"video bytes")
+    assert video.artifact.remote_identity == "emedia:540"
     assert ctx.stats.downloaded == 1
     # Generated file size is not a substitute for bytes observed on the network.
     assert ctx.stats.transferred_bytes == 0

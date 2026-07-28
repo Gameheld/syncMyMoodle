@@ -6,7 +6,7 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
-from syncmymoodle import links, opencast
+from syncmymoodle import artifacts, links, opencast
 from syncmymoodle.constants import COURSE_CACHE_DIRECTORY, COURSE_CACHE_FILENAME
 from syncmymoodle.context import SyncContext
 from syncmymoodle.moodle_tokens import normalized_site
@@ -103,6 +103,9 @@ def _node_artifact_paths(
     node: Node,
     metadata_node: Node,
 ) -> list[Path]:
+    if metadata_node.artifact is not None:
+        artifact_path = artifacts.resolve_artifact_path(ctx, metadata_node.artifact)
+        return [artifact_path] if artifact_path is not None else []
     node_path = _node_path(ctx, node)
     if node.download_kind is not DownloadKind.QUIZ:
         return [node_path]
@@ -740,11 +743,17 @@ def match_old_cache_child(old_node: Node | None, child: Node) -> Node | None:
     if old_node is None:
         return None
 
-    child_youtube_id = links.youtube_video_id_from_node(child)
-    if child_youtube_id is not None:
-        for candidate in old_node.children:
-            if links.youtube_video_id_from_node(candidate) == child_youtube_id:
-                return candidate
+    identity = artifacts.remote_content_identity(child)
+    if identity is not None:
+        matches = [
+            candidate
+            for candidate in old_node.children
+            if (candidate_identity := artifacts.remote_content_identity(candidate))
+            is not None
+            and candidate_identity[0] == identity[0]
+        ]
+        if len(matches) == 1:
+            return matches[0]
     return match_equivalent_child(old_node, child)
 
 
@@ -757,6 +766,7 @@ def node_to_cache_data(
     etag = node.etag
     etag_kind = node.etag_kind
     content_hash = node.content_hash
+    artifact = node.artifact
     artifact_hashes = dict(node.artifact_hashes)
     remote_size = node.remote_size
     is_handled = node.is_handled
@@ -782,6 +792,7 @@ def node_to_cache_data(
         etag = old_node.etag
         etag_kind = old_node.etag_kind
         content_hash = old_node.content_hash
+        artifact = old_node.artifact
         artifact_hashes = dict(old_node.artifact_hashes)
         remote_size = remote_size if remote_size is not None else old_node.remote_size
         is_handled = True
@@ -791,6 +802,7 @@ def node_to_cache_data(
         etag = None
         etag_kind = None
         content_hash = None
+        artifact = None
         artifact_hashes = {}
     return {
         "name": node.name,
@@ -801,7 +813,8 @@ def node_to_cache_data(
         "timemodified": timemodified,
         "etag": etag,
         "etag_kind": str(etag_kind) if etag_kind else None,
-        "content_hash": content_hash,
+        "content_hash": content_hash if artifact is None else None,
+        "artifact": artifact.to_cache_data() if artifact is not None else None,
         "artifact_hashes": artifact_hashes,
         "remote_size": remote_size,
         "name_clash_id": node.name_clash_id,
@@ -840,6 +853,7 @@ def node_from_cache_data(data: dict[str, Any], parent: Node | None = None) -> No
         etag=data.get("etag"),
         etag_kind=data.get("etag_kind"),
         content_hash=data.get("content_hash"),
+        artifact=data.get("artifact"),
         artifact_hashes=data.get("artifact_hashes"),
         remote_size=data.get("remote_size"),
         name_clash_id=data.get("name_clash_id", NAME_CLASH_ID_UNSET),
