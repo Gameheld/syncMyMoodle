@@ -7,7 +7,7 @@ import pytest
 from rich.console import Console
 from rich.progress import Progress
 
-from syncmymoodle.outcomes import RemovedContent, RunStatistics
+from syncmymoodle.outcomes import FailureCode, RemovedContent, RunStatistics
 from syncmymoodle.output import TerminalOutput, safe_terminal_text
 
 
@@ -486,22 +486,32 @@ def test_run_summary_reports_outcomes_and_transferred_size(monkeypatch):
         downloaded=3,
         updated=1,
         unchanged=4,
-        failed=1,
         transferred_bytes=1536,
         started_at=time.monotonic(),
     )
+    for code in FailureCode:
+        stats.record_failure(code)
 
     TerminalOutput().summary(stats, filtered=5, dry_run=False)
 
     summary = stdout.getvalue()
     assert "2 courses, 3 downloaded, 1 updated, 4 unchanged" in summary
-    assert "5 filtered, 1 failed, 1.5 KiB transferred" in summary
+    assert "5 policy skips, 4 failed, 1.5 KiB transferred" in summary
+    assert (
+        "Diagnostics: [SMM-NETWORK-PROVIDER] 1 network/provider failure; "
+        "[SMM-POLICY-SKIP] 5 policy skips; "
+        "[SMM-AUTHENTICATION] 1 authentication error; "
+        "[SMM-LOCAL-STORAGE] 1 local storage failure; "
+        "[SMM-INTERNAL] 1 internal exception."
+    ) in summary
 
     stdout.seek(0)
     stdout.truncate()
     stats.planned = 7
     TerminalOutput().summary(stats, filtered=5, dry_run=True)
-    assert "7 would download, 4 unchanged, 5 filtered, 1 failed" in stdout.getvalue()
+    assert "7 would download, 4 unchanged, 5 policy skips, 4 failed" in (
+        stdout.getvalue()
+    )
 
 
 def test_removed_content_report_states_that_local_files_are_kept(

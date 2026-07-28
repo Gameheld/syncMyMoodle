@@ -30,6 +30,7 @@ from syncmymoodle.http_utils import (
     safe_request_error,
 )
 from syncmymoodle.node import DownloadKind, Node, RemoteMarkerKind
+from syncmymoodle.outcomes import FailureCode
 
 logger = logging.getLogger(__name__)
 H5P_PACKAGE_MAX_BYTES = 2 * 1024**3
@@ -58,11 +59,18 @@ class ModuleContext:
     def mark_incomplete(self) -> None:
         self.ctx.mark_course_incomplete(self.course_node.id)
 
-    def fail(self) -> None:
-        self.ctx.record_course_failure(self.course_node.id)
+    def fail(
+        self,
+        code: FailureCode = FailureCode.NETWORK_PROVIDER,
+    ) -> None:
+        self.ctx.record_course_failure(self.course_node.id, code)
 
-    def fail_once(self, source: str) -> None:
-        self.ctx.record_course_failure_once(self.course_node.id, source)
+    def fail_once(
+        self,
+        source: str,
+        code: FailureCode = FailureCode.NETWORK_PROVIDER,
+    ) -> None:
+        self.ctx.record_course_failure_once(self.course_node.id, source, code)
 
 
 @dataclass(frozen=True)

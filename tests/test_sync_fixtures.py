@@ -20,6 +20,7 @@ from syncmymoodle.constants import HTTP_TIMEOUT_SECONDS
 from syncmymoodle.context import MoodleAccount
 from syncmymoodle.moodle_tokens import MoodleTokens
 from syncmymoodle.node import Node
+from syncmymoodle.outcomes import FailureCode
 
 from .helpers import (
     FakeResponse,
@@ -107,6 +108,7 @@ def test_page_request_failure_is_counted(caplog):
     ctx = run_page_handler(fail_request)
 
     assert ctx.stats.failed == 1
+    assert ctx.stats.failure_counts == {FailureCode.NETWORK_PROVIDER: 1}
     assert "Failed to fetch page module 123" in caplog.text
 
 

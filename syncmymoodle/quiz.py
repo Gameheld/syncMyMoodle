@@ -52,7 +52,9 @@ from syncmymoodle.outcomes import (
     HANDLED_DOWNLOAD,
     PLANNED_DOWNLOAD,
     DownloadOutcome,
+    FailureCode,
     completed_download,
+    failed_download,
 )
 
 logger = logging.getLogger(__name__)
@@ -814,12 +816,16 @@ def _retain_old_quiz_revision(
         node.etag = None
         node.etag_kind = None
         node.artifact_hashes = {}
-        return DownloadOutcome(unchanged=unchanged, cache_verified=False)
+        return DownloadOutcome(
+            unchanged=unchanged,
+            policy_skipped=1,
+            cache_verified=False,
+        )
     node.timemodified = old_node.timemodified
     node.etag = old_node.etag
     node.etag_kind = old_node.etag_kind
     node.artifact_hashes = dict(old_node.artifact_hashes)
-    return DownloadOutcome(unchanged=unchanged)
+    return DownloadOutcome(unchanged=unchanged, policy_skipped=1)
 
 
 def _temporary_quiz_path(path: Path) -> Path:
@@ -851,12 +857,16 @@ def _install_quiz_artifact(
     if install_result is not storage.InstallResult.INSTALLED:
         staged_path.unlink(missing_ok=True)
         if install_result is storage.InstallResult.KEPT_LOCAL:
-            return DownloadOutcome(unchanged=1, cache_verified=False)
-        return FAILED_DOWNLOAD
+            return DownloadOutcome(
+                unchanged=1,
+                policy_skipped=1,
+                cache_verified=False,
+            )
+        return failed_download(FailureCode.LOCAL_STORAGE)
 
     digest = storage.file_sha256(target_path)
     if digest is None:
-        return FAILED_DOWNLOAD
+        return failed_download(FailureCode.LOCAL_STORAGE)
     node.artifact_hashes[kind] = digest
     ctx.downloaded_paths.add(target_path)
     if kind == "html":
@@ -1138,7 +1148,7 @@ def download_quiz(
     """
     mode = ctx.config.quiz_mode
     if mode == "off" or node.parent is None:
-        return FAILED_DOWNLOAD
+        return failed_download(FailureCode.INTERNAL)
     want_html = mode in ("html", "both")
     want_pdf = mode in ("pdf", "both")
 

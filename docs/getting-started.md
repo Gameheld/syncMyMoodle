@@ -240,7 +240,7 @@ Every sync ends with a summary. A successful writing run resembles:
 
 ```text
 Sync complete in ...: ... courses, ... downloaded, ... updated, ... unchanged,
-... filtered, 0 failed, ... transferred.
+... policy skips, 0 failed, ... transferred.
 ```
 
 When an individual course, module, or download fails, syncMyMoodle normally

@@ -11,7 +11,12 @@ from syncmymoodle.config import Config
 from syncmymoodle.http_utils import ServiceOutageTracker
 from syncmymoodle.moodle_tokens import MoodleTokens
 from syncmymoodle.node import Node, RemoteMarkerKind
-from syncmymoodle.outcomes import RemovedContent, RunStatistics
+from syncmymoodle.outcomes import (
+    AuthenticationFailure,
+    FailureCode,
+    RemovedContent,
+    RunStatistics,
+)
 from syncmymoodle.output import TerminalOutput, get_output
 from syncmymoodle.pathing import InternalPathRoot
 
@@ -32,7 +37,7 @@ ModuleInstanceCache = dict[int, dict[int, dict[str, Any]] | None]
 TransferReuseKey = tuple[str, str, RemoteMarkerKind, str]
 
 
-class BrowserSessionUnavailable(RuntimeError):
+class BrowserSessionUnavailable(AuthenticationFailure):
     pass
 
 
@@ -227,12 +232,21 @@ class SyncContext:
         ):
             self.inventory_filtered_course_ids.add(course_id)
 
-    def record_course_failure(self, course_id: Any) -> None:
+    def record_course_failure(
+        self,
+        course_id: Any,
+        code: FailureCode = FailureCode.NETWORK_PROVIDER,
+    ) -> None:
         """Record a failed course source and retain its last complete cache."""
-        self.stats.failed += 1
+        self.stats.record_failure(code)
         self.mark_course_incomplete(course_id)
 
-    def record_course_failure_once(self, course_id: Any, source: str) -> None:
+    def record_course_failure_once(
+        self,
+        course_id: Any,
+        source: str,
+        code: FailureCode = FailureCode.NETWORK_PROVIDER,
+    ) -> None:
         """Record one failed source once per affected course."""
         if (
             isinstance(course_id, int)
@@ -243,7 +257,7 @@ class SyncContext:
             if failure_key in self.reported_course_failure_sources:
                 return
             self.reported_course_failure_sources.add(failure_key)
-        self.record_course_failure(course_id)
+        self.record_course_failure(course_id, code)
 
     def require_session(self) -> requests.Session:
         """Return the token-capable general HTTP session."""

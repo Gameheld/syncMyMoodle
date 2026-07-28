@@ -6,7 +6,7 @@ import pytest
 from syncmymoodle import course_cache, downloader, moodle, sync, sync_handlers
 from syncmymoodle.context import SyncContext
 from syncmymoodle.node import DownloadKind, Node
-from syncmymoodle.outcomes import RemovedContent
+from syncmymoodle.outcomes import FailureCode, RemovedContent
 from syncmymoodle.storage import read_private_gzip_json
 
 from .helpers import FakeSession, make_context, node_path
@@ -166,9 +166,10 @@ def test_same_remote_identity_at_a_new_name_is_not_reported_removed(
     assert current.removed_content == set()
 
 
-def test_failed_module_scan_does_not_report_cached_content_removed(
+def test_internal_module_exception_does_not_report_cached_content_removed(
     tmp_path,
     monkeypatch,
+    caplog,
 ):
     config, _ = seed_resource_cache(tmp_path, monkeypatch)
     install_course_inventory(monkeypatch, [resource_module()])
@@ -182,8 +183,10 @@ def test_failed_module_scan_does_not_report_cached_content_removed(
     sync.sync(current)
 
     assert current.stats.failed == 1
+    assert current.stats.failure_counts == {FailureCode.INTERNAL: 1}
     assert current.incomplete_course_ids == {COURSE_ID}
     assert current.removed_content == set()
+    assert "[SMM-INTERNAL] Failed to process Moodle module" in caplog.text
 
     course_cache.cache_root_node(current)
     install_course_inventory(monkeypatch, [])

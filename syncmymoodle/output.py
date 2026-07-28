@@ -28,7 +28,12 @@ from rich.progress import (
 )
 from rich.text import Text
 
-from syncmymoodle.outcomes import RemovedContent, RunStatistics
+from syncmymoodle.outcomes import (
+    POLICY_SKIP_CODE,
+    FailureCode,
+    RemovedContent,
+    RunStatistics,
+)
 
 ColorMode = Literal["auto", "always", "never"]
 COLOR_MODES: tuple[ColorMode, ...] = ("auto", "always", "never")
@@ -870,12 +875,13 @@ class TerminalOutput:
             if stats.courses == 1
             else f"{stats.courses} courses"
         )
+        policy_skips = filtered + stats.policy_skipped
         if dry_run:
             outcomes = [
                 course_outcome,
                 f"{stats.planned} would download",
                 f"{stats.unchanged} unchanged",
-                f"{filtered} filtered",
+                f"{policy_skips} policy skips",
                 f"{stats.failed} failed",
             ]
             prefix = "Dry run complete"
@@ -885,7 +891,7 @@ class TerminalOutput:
                 f"{stats.downloaded} downloaded",
                 f"{stats.updated} updated",
                 f"{stats.unchanged} unchanged",
-                f"{filtered} filtered",
+                f"{policy_skips} policy skips",
                 f"{stats.failed} failed",
             ]
             if stats.transferred_bytes:
@@ -893,6 +899,39 @@ class TerminalOutput:
             prefix = "Sync complete"
         message = f"{prefix} in {stats.elapsed_seconds:.1f}s: {', '.join(outcomes)}."
         self.print(message, style="red" if stats.failed else "green")
+        diagnostic_counts = [
+            (
+                FailureCode.NETWORK_PROVIDER,
+                stats.failure_counts.get(FailureCode.NETWORK_PROVIDER, 0),
+                "network/provider failure",
+            ),
+            (POLICY_SKIP_CODE, policy_skips, "policy skip"),
+            (
+                FailureCode.AUTHENTICATION,
+                stats.failure_counts.get(FailureCode.AUTHENTICATION, 0),
+                "authentication error",
+            ),
+            (
+                FailureCode.LOCAL_STORAGE,
+                stats.failure_counts.get(FailureCode.LOCAL_STORAGE, 0),
+                "local storage failure",
+            ),
+            (
+                FailureCode.INTERNAL,
+                stats.failure_counts.get(FailureCode.INTERNAL, 0),
+                "internal exception",
+            ),
+        ]
+        diagnostics = [
+            f"[{code}] {count} {label}{'' if count == 1 else 's'}"
+            for code, count, label in diagnostic_counts
+            if count
+        ]
+        if diagnostics:
+            self.print(
+                f"Diagnostics: {'; '.join(diagnostics)}.",
+                style="red" if stats.failed else "yellow",
+            )
 
     def logging_handler(self) -> logging.Handler:
         return TerminalLogHandler(self)

@@ -20,9 +20,10 @@ from syncmymoodle.constants import (
     YOUTUBE_WATCH_URL,
     YT_DLP_TESTED_VERSION,
 )
+from syncmymoodle.context import BrowserSessionUnavailable
 from syncmymoodle.downloader import download_file
 from syncmymoodle.node import DownloadKind, DownloadStatus, Node, RemoteMarkerKind
-from syncmymoodle.outcomes import HANDLED_DOWNLOAD
+from syncmymoodle.outcomes import HANDLED_DOWNLOAD, FailureCode
 from syncmymoodle.output import format_size
 from syncmymoodle.storage import read_private_gzip_json, write_private_gzip_json
 
@@ -606,6 +607,33 @@ def test_download_dispatch_uses_semantic_kind_not_display_type(monkeypatch):
     assert dispatched == [node]
 
 
+@pytest.mark.parametrize(
+    ("error", "code"),
+    [
+        (requests.ConnectionError("offline"), FailureCode.NETWORK_PROVIDER),
+        (
+            BrowserSessionUnavailable("session expired"),
+            FailureCode.AUTHENTICATION,
+        ),
+        (OSError("disk unavailable"), FailureCode.LOCAL_STORAGE),
+        (RuntimeError("unexpected bug"), FailureCode.INTERNAL),
+    ],
+)
+def test_download_walk_classifies_isolated_exceptions(monkeypatch, error, code):
+    ctx = make_context()
+    root, file_node = build_single_file_tree("slides.pdf", URL)
+
+    def fail_download(*args):
+        raise error
+
+    monkeypatch.setattr(downloader, "download_file", fail_download)
+
+    downloader.download_node_tree(ctx, root)
+
+    assert not file_node.is_handled
+    assert ctx.stats.failure_counts == {code: 1}
+
+
 # --------------------------------------------------------------------------
 # Actual download happy path (gap 2)
 # --------------------------------------------------------------------------
@@ -744,7 +772,10 @@ def test_download_rejects_short_body(tmp_path, headers, remote_size):
         ),
     )
 
-    assert not download_file(syncer, file_node).is_handled
+    outcome = download_file(syncer, file_node)
+
+    assert not outcome.is_handled
+    assert outcome.failure_code is FailureCode.NETWORK_PROVIDER
     assert not download_path.exists()
     assert list(download_path.parent.glob(".*.smmpart*")) == []
 
@@ -1305,7 +1336,10 @@ def test_download_rejects_redirect_outside_allowed_domains(tmp_path, caplog):
     )
     caplog.set_level(logging.WARNING, logger="syncmymoodle.downloader")
 
-    assert not download_file(syncer, file_node).is_handled
+    outcome = download_file(syncer, file_node)
+
+    assert outcome.is_handled
+    assert not outcome.cache_verified
     assert syncer.session.calls == [("GET", URL)]
     assert not node_path(syncer, file_node).exists()
     assert caplog.messages == []
@@ -2105,7 +2139,10 @@ def test_rename_conflict_non_2xx_update_preserves_canonical_file(tmp_path):
     )
     syncer.session.add("GET", URL, FakeResponse(status_code=403, text="forbidden"))
 
-    assert not download_file(syncer, file_node).is_handled
+    outcome = download_file(syncer, file_node)
+
+    assert not outcome.is_handled
+    assert outcome.failure_code is FailureCode.AUTHENTICATION
     assert download_path.read_bytes() == local_modified
     assert list(download_path.parent.glob("*.syncconflict.*")) == []
 
@@ -2575,6 +2612,7 @@ def test_reused_transfer_preserves_a_target_created_while_staging(
     outcome = download_file(syncer, second)
 
     assert outcome.unchanged == 1
+    assert outcome.policy_skipped == 1
     assert not outcome.cache_verified
     assert syncer.session.count("GET", SCIEBO_URL) == 1
     assert second_path.read_bytes() == local_edit
@@ -2936,6 +2974,8 @@ def test_update_disabled_does_not_verify_an_untracked_existing_file(tmp_path):
     downloader.download_node_tree(initial, root)
     course_cache.cache_root_node(initial)
 
+    assert initial.stats.policy_skipped == 1
+    assert initial.stats.failed == 0
     cached_file = course_cache.get_old_node_for(initial, file_node)
     assert cached_file is not None
     assert cached_file.download_status is DownloadStatus.SKIPPED

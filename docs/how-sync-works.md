@@ -215,6 +215,21 @@ Every run ends with a summary. Failures in one course, module, or transfer
 normally do not abort all remaining work. The program continues where possible,
 then exits nonzero after the summary.
 
+The final diagnostic line classifies outcomes with stable codes:
+
+| Code                       | Meaning                                                        |
+|----------------------------|----------------------------------------------------------------|
+| `SMM-NETWORK-PROVIDER`     | A network request or external content provider failed          |
+| `SMM-POLICY-SKIP`          | Configured sync policy deliberately skipped an item             |
+| `SMM-AUTHENTICATION`       | Authentication or authorization prevented access                |
+| `SMM-LOCAL-STORAGE`        | A local file or durability operation failed                     |
+| `SMM-INTERNAL`             | An unexpected internal exception was isolated to one resource   |
+
+Policy skips do not make the command fail. The other codes contribute to the
+failed count and exit status `1`. `SMM-INTERNAL` distinguishes caught
+programming errors from ordinary provider outages while still allowing
+unaffected resources to finish.
+
 ## Dry runs
 
 A dry run performs discovery and planning but does not write downloaded files

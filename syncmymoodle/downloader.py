@@ -50,7 +50,10 @@ from syncmymoodle.outcomes import (
     SKIPPED_DOWNLOAD,
     UNCHANGED_DOWNLOAD,
     DownloadOutcome,
+    FailureCode,
+    classify_exception,
     completed_download,
+    failed_download,
 )
 from syncmymoodle.output import TransferProgress, format_size
 
@@ -1115,10 +1118,11 @@ def noninstalled_download_outcome(
     if result is storage.InstallResult.KEPT_LOCAL:
         return DownloadOutcome(
             unchanged=1,
+            policy_skipped=1,
             transferred_bytes=transferred_bytes,
             cache_verified=False,
         )
-    return FAILED_DOWNLOAD
+    return failed_download(FailureCode.LOCAL_STORAGE)
 
 
 def record_download_metadata(
@@ -1321,7 +1325,16 @@ def process_download_response(
 
     resume_size = transfer.resume_size if transfer is not None else 0
     if not download_response_is_usable(node, response, downloadpath, log):
-        return FAILED_DOWNLOAD
+        code = (
+            FailureCode.AUTHENTICATION
+            if response.status_code in {401, 403}
+            or (
+                content_type_without_parameters(response) in HTML_CONTENT_TYPES
+                and not node_allows_html_download(node)
+            )
+            else FailureCode.NETWORK_PROVIDER
+        )
+        return failed_download(code)
     response_size = trustworthy_response_size(response, resume_size)
     if response_size_violates_limit(ctx, node, response_size, downloadpath):
         return SKIPPED_DOWNLOAD
@@ -1333,7 +1346,7 @@ def process_download_response(
     content = response.iter_content(DEFAULT_BLOCK_SIZE)
     first_chunk = next((chunk for chunk in content if chunk), b"")
     if not response_body_is_usable(node, first_chunk, downloadpath, log):
-        return FAILED_DOWNLOAD
+        return failed_download(FailureCode.AUTHENTICATION)
 
     existed = downloadpath.exists()
     with ctx.output.tracked_action("Downloading", downloadpath, node.type) as action:
@@ -1454,7 +1467,7 @@ def download_file(
     )
 
     if not node.url:
-        return FAILED_DOWNLOAD
+        return failed_download(FailureCode.INTERNAL)
     download_origin = normalized_http_origin(node.url)
     action_or_outcome = prepare_download_or_reuse(
         ctx,
@@ -1471,7 +1484,7 @@ def download_file(
     if node.download_kind is DownloadKind.OPENCAST:
         authorized, opencast_course_id = authorize_opencast_download(ctx, node, log)
         if not authorized:
-            return FAILED_DOWNLOAD
+            return failed_download(FailureCode.AUTHENTICATION)
 
     transfer = None if ctx.config.dry_run else prepare_transfer_plan(node, downloadpath)
     headers = (
@@ -1489,6 +1502,8 @@ def download_file(
             stream=True,
             timeout=HTTP_TIMEOUT_SECONDS,
         )
+    except filters.FilteredRequestError:
+        return SKIPPED_DOWNLOAD
     except requests.RequestException as error:
         _report_download_request_failure(
             ctx,
@@ -1556,11 +1571,23 @@ def download_leaf(
         if node.download_kind is DownloadKind.QUIZ:
             return quiz.download_quiz(ctx, node, log)
         return download_file(ctx, node, log)
-    except Exception:
-        log.exception("Failed to download the module %s", node)
+    except filters.FilteredRequestError:
+        return SKIPPED_DOWNLOAD
+    except yt_dlp.utils.DownloadError:
+        log.exception(
+            "[%s] Failed to download the module %s",
+            FailureCode.NETWORK_PROVIDER,
+            node,
+        )
         if node.download_kind in {DownloadKind.YOUTUBE, DownloadKind.EMEDIA}:
             log_yt_dlp_failure(log)
         return FAILED_DOWNLOAD
+    except Exception as error:
+        code = classify_exception(error)
+        log.exception("[%s] Failed to download the module %s", code, node)
+        if node.download_kind in {DownloadKind.YOUTUBE, DownloadKind.EMEDIA}:
+            log_yt_dlp_failure(log)
+        return failed_download(code)
 
 
 def download_node_tree(
@@ -1601,7 +1628,7 @@ def download_emedia_video(
 ) -> DownloadOutcome:
     """Download the best single stream from a VEIRA HLS playlist."""
     if node.url is None:
-        return FAILED_DOWNLOAD
+        return failed_download(FailureCode.INTERNAL)
     downloadpath = pathing.get_sanitized_node_path(
         node, Path(ctx.config.sync_directory)
     )
@@ -1696,7 +1723,7 @@ def scan_and_download_youtube(
 ) -> DownloadOutcome:
     """Download Youtube-Videos using yt_dlp."""
     if node.parent is None or node.url is None:
-        return FAILED_DOWNLOAD
+        return failed_download(FailureCode.INTERNAL)
     path = pathing.get_sanitized_node_path(node.parent, Path(ctx.config.sync_directory))
     link = node.url
     course_node = _course_node(node)

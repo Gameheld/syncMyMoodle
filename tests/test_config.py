@@ -27,6 +27,7 @@ from syncmymoodle.config import (
     group_config_for_toml,
 )
 from syncmymoodle.context import AuthState
+from syncmymoodle.outcomes import FailureCode
 from syncmymoodle.output import TerminalOutput
 
 from .helpers import FakeKeyring, make_context
@@ -218,7 +219,7 @@ def test_partial_sync_failure_exits_nonzero_after_run(tmp_path, monkeypatch):
 
     def fail_one_item(ctx, *, show_filtered=False):
         del show_filtered
-        ctx.stats.failed = 1
+        ctx.stats.record_failure(FailureCode.NETWORK_PROVIDER)
 
     monkeypatch.setattr(cli, "run", fail_one_item)
 

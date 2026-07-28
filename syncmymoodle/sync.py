@@ -11,7 +11,7 @@ from syncmymoodle import moodle as moodle_api
 from syncmymoodle.context import SyncContext
 from syncmymoodle.http_utils import canonical_remote_url, redact_url_secrets
 from syncmymoodle.node import DownloadKind, Node, NodeKind
-from syncmymoodle.outcomes import RemovedContent
+from syncmymoodle.outcomes import FailureCode, RemovedContent, classify_exception
 from syncmymoodle.pathing import sanitized_node_path_parts
 
 logger = logging.getLogger(__name__)
@@ -268,7 +268,7 @@ def _course_spec_from_summary(
         logger.error(
             "Ignoring malformed Moodle course summary at position %s", position
         )
-        ctx.stats.failed += 1
+        ctx.stats.record_failure(FailureCode.NETWORK_PROVIDER)
         return None
     course_id = _positive_int(value.get("id"))
     if course_id is None:
@@ -276,7 +276,7 @@ def _course_spec_from_summary(
             "Ignoring Moodle course summary with an invalid id at position %s",
             position,
         )
-        ctx.stats.failed += 1
+        ctx.stats.record_failure(FailureCode.NETWORK_PROVIDER)
         return None
 
     shortname = value.get("shortname")
@@ -289,7 +289,7 @@ def _course_spec_from_summary(
             "Ignoring malformed Moodle course summary for course %s",
             course_id,
         )
-        ctx.stats.failed += 1
+        ctx.stats.record_failure(FailureCode.NETWORK_PROVIDER)
         return None
     safe_shortname = shortname if isinstance(shortname, str) else ""
     safe_idnumber = idnumber if isinstance(idnumber, str) else ""
@@ -312,7 +312,7 @@ def _locally_selected_courses(ctx: SyncContext) -> list[_CourseSpec]:
     )
     if not isinstance(summaries, list):
         logger.error("Moodle returned a malformed course summary inventory")
-        ctx.stats.failed += 1
+        ctx.stats.record_failure(FailureCode.NETWORK_PROVIDER)
         return courses
     for position, summary in enumerate(summaries, start=1):
         spec = _course_spec_from_summary(ctx, summary, position)
@@ -526,10 +526,14 @@ def _sync_module(
     try:
         if not filters.should_skip_module(run.ctx, module, module_context.course_id):
             sync_handlers.handle_module(module_context, module)
-    except Exception:
-        module_context.fail()
+    except filters.FilteredRequestError:
+        pass
+    except Exception as error:
+        code = classify_exception(error)
+        module_context.fail(code)
         logger.exception(
-            "Failed to process Moodle module %s (%s)",
+            "[%s] Failed to process Moodle module %s (%s)",
+            code,
             module.get("id"),
             module.get("modname"),
         )
@@ -620,9 +624,12 @@ def _sync_course_safely(
 ) -> None:
     try:
         _sync_course(ctx, root_node, course, course_index)
-    except Exception:
-        ctx.record_course_failure(course.node.id)
-        logger.exception("Failed to process Moodle course %s", course.name)
+    except filters.FilteredRequestError:
+        ctx.output.sync_progress.finish_course(course_index)
+    except Exception as error:
+        code = classify_exception(error)
+        ctx.record_course_failure(course.node.id, code)
+        logger.exception("[%s] Failed to process Moodle course %s", code, course.name)
         ctx.output.sync_progress.finish_course(course_index)
 
 
