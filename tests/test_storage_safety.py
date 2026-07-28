@@ -411,7 +411,7 @@ def test_windows_install_requests_write_through_replacement(tmp_path, monkeypatc
     moves = []
     real_import = importlib.import_module
     real_replace = os.replace
-    fake_win32con = SimpleNamespace(
+    fake_win32file = SimpleNamespace(
         MOVEFILE_REPLACE_EXISTING=1,
         MOVEFILE_WRITE_THROUGH=8,
     )
@@ -420,11 +420,9 @@ def test_windows_install_requests_write_through_replacement(tmp_path, monkeypatc
         moves.append((source, destination, flags))
         real_replace(source, destination)
 
-    fake_win32file = SimpleNamespace(MoveFileEx=move_file_ex)
+    fake_win32file.MoveFileEx = move_file_ex
 
     def import_module(name):
-        if name == "win32con":
-            return fake_win32con
         if name == "win32file":
             return fake_win32file
         return real_import(name)

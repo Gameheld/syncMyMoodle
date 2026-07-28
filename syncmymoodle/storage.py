@@ -77,13 +77,12 @@ class SyncRunLockedError(RuntimeError):
 
 def _replace_staged_path(staged_path: Path, target_path: Path) -> None:
     if os.name == "nt":
-        win32con: Any = importlib.import_module("win32con")
         win32file: Any = importlib.import_module("win32file")
         try:
             win32file.MoveFileEx(
                 os.fspath(staged_path),
                 os.fspath(target_path),
-                win32con.MOVEFILE_REPLACE_EXISTING | win32con.MOVEFILE_WRITE_THROUGH,
+                win32file.MOVEFILE_REPLACE_EXISTING | win32file.MOVEFILE_WRITE_THROUGH,
             )
         except Exception as error:
             pywintypes: Any = importlib.import_module("pywintypes")
