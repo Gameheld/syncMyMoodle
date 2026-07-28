@@ -71,6 +71,50 @@ class SyncRunLockedError(RuntimeError):
     pass
 
 
+def _replace_staged_path(staged_path: Path, target_path: Path) -> None:
+    if os.name == "nt":
+        win32con: Any = importlib.import_module("win32con")
+        win32file: Any = importlib.import_module("win32file")
+        try:
+            win32file.MoveFileEx(
+                os.fspath(staged_path),
+                os.fspath(target_path),
+                win32con.MOVEFILE_REPLACE_EXISTING | win32con.MOVEFILE_WRITE_THROUGH,
+            )
+        except Exception as error:
+            pywintypes: Any = importlib.import_module("pywintypes")
+            if isinstance(error, pywintypes.error):
+                raise OSError(*error.args) from error
+            raise
+        return
+    os.replace(staged_path, target_path)
+
+
+def _fsync_directory(path: Path) -> None:
+    if os.name == "nt":
+        # The Windows replacement uses MOVEFILE_WRITE_THROUGH because Python
+        # cannot open a directory descriptor suitable for os.fsync().
+        return
+    flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+    descriptor = os.open(path, flags)
+    try:
+        os.fsync(descriptor)
+    finally:
+        os.close(descriptor)
+
+
+def _durable_replace(staged_path: Path, target_path: Path) -> None:
+    """Persist staged bytes and the atomic namespace update before returning."""
+    # Windows requires a writable handle for FlushFileBuffers, which backs
+    # os.fsync there. Staged files are private working copies owned by us.
+    with staged_path.open("r+b") as staged_file:
+        os.fsync(staged_file.fileno())
+    _replace_staged_path(staged_path, target_path)
+    _fsync_directory(target_path.parent)
+    if staged_path.parent != target_path.parent:
+        _fsync_directory(staged_path.parent)
+
+
 def file_sha256(path: Path) -> str | None:
     """Return a file's SHA-256 digest, or ``None`` when it cannot be read."""
     try:
@@ -163,7 +207,7 @@ def install_staged_file(
                 conflict_path,
                 description,
             )
-        os.replace(staged_path, target_path)
+        _durable_replace(staged_path, target_path)
         return InstallResult.INSTALLED
     except OSError:
         log.exception("Failed to install %s at %s", description, target_path)
@@ -311,7 +355,7 @@ def write_private_bytes(path: Path, data: bytes, description: str) -> None:
         with os.fdopen(fd, "wb") as f:
             fd = -1
             f.write(data)
-        os.replace(tmp_path, path)
+        _durable_replace(tmp_path, path)
     finally:
         if fd >= 0:
             os.close(fd)

@@ -290,7 +290,10 @@ def test_private_text_write_is_atomic_and_private(tmp_path, monkeypatch):
     def failed_replace(source, destination):
         raise OSError("simulated replace failure")
 
-    monkeypatch.setattr(os, "replace", failed_replace)
+    monkeypatch.setattr(
+        "syncmymoodle.storage._replace_staged_path",
+        failed_replace,
+    )
 
     with pytest.raises(OSError, match="simulated replace failure"):
         write_private_text(target, "replacement", "config")
@@ -307,8 +310,7 @@ def test_failed_conflict_install_restores_original_file(tmp_path, monkeypatch):
     baseline = snapshot_file(target)
 
     monkeypatch.setattr(
-        os,
-        "replace",
+        "syncmymoodle.storage._replace_staged_path",
         lambda source, destination: (_ for _ in ()).throw(OSError("disk full")),
     )
 
@@ -324,6 +326,112 @@ def test_failed_conflict_install_restores_original_file(tmp_path, monkeypatch):
     assert result is InstallResult.FAILED
     assert target.read_bytes() == b"local edit"
     assert list(tmp_path.glob("*.syncconflict.*")) == []
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync semantics")
+def test_install_fsyncs_staged_file_and_directory_around_replace(
+    tmp_path,
+    monkeypatch,
+):
+    target = tmp_path / "slides.pdf"
+    staged = tmp_path / ".slides.pdf.smmpart"
+    staged.write_bytes(b"remote update")
+    events = []
+    real_replace = os.replace
+
+    def record_fsync(descriptor):
+        kind = "directory" if stat.S_ISDIR(os.fstat(descriptor).st_mode) else "file"
+        events.append(kind)
+
+    def record_replace(source, destination):
+        events.append("replace")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+    monkeypatch.setattr(os, "replace", record_replace)
+
+    result = install_staged_file(
+        staged,
+        target,
+        baseline=snapshot_file(target),
+        rename_local=False,
+        target_change_policy="overwrite",
+        description="test update",
+    )
+
+    assert result is InstallResult.INSTALLED
+    assert target.read_bytes() == b"remote update"
+    assert events == ["file", "replace", "directory"]
+
+
+@pytest.mark.skipif(os.name == "nt", reason="POSIX directory fsync semantics")
+def test_install_does_not_report_success_when_directory_fsync_fails(
+    tmp_path,
+    monkeypatch,
+):
+    target = tmp_path / "slides.pdf"
+    staged = tmp_path / ".slides.pdf.smmpart"
+    staged.write_bytes(b"remote update")
+
+    def fail_directory_fsync(descriptor):
+        if stat.S_ISDIR(os.fstat(descriptor).st_mode):
+            raise OSError("simulated directory fsync failure")
+
+    monkeypatch.setattr(os, "fsync", fail_directory_fsync)
+
+    result = install_staged_file(
+        staged,
+        target,
+        baseline=snapshot_file(target),
+        rename_local=False,
+        target_change_policy="overwrite",
+        description="test update",
+    )
+
+    assert result is InstallResult.FAILED
+    assert target.read_bytes() == b"remote update"
+
+
+def test_windows_install_requests_write_through_replacement(tmp_path, monkeypatch):
+    target = tmp_path / "slides.pdf"
+    staged = tmp_path / ".slides.pdf.smmpart"
+    staged.write_bytes(b"remote update")
+    moves = []
+    real_import = importlib.import_module
+    real_replace = os.replace
+    fake_win32con = SimpleNamespace(
+        MOVEFILE_REPLACE_EXISTING=1,
+        MOVEFILE_WRITE_THROUGH=8,
+    )
+
+    def move_file_ex(source, destination, flags):
+        moves.append((source, destination, flags))
+        real_replace(source, destination)
+
+    fake_win32file = SimpleNamespace(MoveFileEx=move_file_ex)
+
+    def import_module(name):
+        if name == "win32con":
+            return fake_win32con
+        if name == "win32file":
+            return fake_win32file
+        return real_import(name)
+
+    monkeypatch.setattr(os, "name", "nt")
+    monkeypatch.setattr(importlib, "import_module", import_module)
+
+    result = install_staged_file(
+        staged,
+        target,
+        baseline=snapshot_file(target),
+        rename_local=False,
+        target_change_policy="overwrite",
+        description="test update",
+    )
+
+    assert result is InstallResult.INSTALLED
+    assert target.read_bytes() == b"remote update"
+    assert moves == [(str(staged), str(target), 9)]
 
 
 def test_file_snapshot_captures_common_digests_in_one_baseline(tmp_path):

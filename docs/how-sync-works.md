@@ -194,6 +194,11 @@ Writing syncs use temporary staging locations before files are installed at
 their final paths. This reduces the chance that an interrupted transfer leaves a
 partially written target file.
 
+Before an atomic replacement, syncMyMoodle flushes the staged file to stable
+storage. It then flushes the containing directory after the replacement on
+POSIX systems; Windows replacements use the equivalent write-through move.
+The install is not reported as successful if either durability step fails.
+
 A run lock under the sync directory prevents two writing syncs from modifying
 the same tree concurrently. Read-only dry runs do not take the writer lock.
 
